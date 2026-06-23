@@ -1,0 +1,18 @@
+services:
+  bot:
+    build:
+      context: .
+    container_name: ozon-bot
+    restart: unless-stopped
+    init: true
+    shm_size: "2gb"
+    stop_grace_period: 30s
+    environment:
+      TZ: Asia/Qyzylorda
+      CHROME_BIN: /usr/bin/chromium
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config.txt:/app/config.txt
+      - ./output:/app/output
+      - ./reports:/app/reports
+      - ./logs:/app/logs

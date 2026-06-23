@@ -1,0 +1,383 @@
+import asyncio
+import tempfile
+import unittest
+from decimal import Decimal
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from openpyxl import load_workbook
+
+from app import run_internet_comparison
+from services import internet_compare
+from services.report import (
+    INTERNET_REPORT_COLUMNS,
+    save_internet_comparison_report,
+)
+
+
+class InternetSearchTests(unittest.TestCase):
+    def test_builds_exact_model_query(self):
+        product = {
+            "title": "REDMOND Мультиварка RMC-M52",
+            "brand": None,
+        }
+        self.assertEqual(
+            internet_compare._build_search_query(product),
+            '"REDMOND RMC-M52" цена Казахстан купить',
+        )
+
+    def test_parses_kazakhstan_results_and_excludes_ozon(self):
+        html = """
+        <ul>
+          <li class="serp-item">
+            <a class="OrganicHost-Link"
+               href="https://ozon.kz/product/test">Ozon</a>
+          </li>
+          <li class="serp-item">
+            <a class="OrganicHost-Link"
+               href="https://shop.example.kz/product/1">Shop</a>
+            REDMOND RMC-M52 29 990 тг
+          </li>
+          <li class="serp-item">
+            <a class="OrganicHost-Link"
+               href="https://example.com/product/1">Foreign</a>
+          </li>
+        </ul>
+        """
+        results = internet_compare._parse_search_results(html)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "shop.example.kz")
+
+    def test_parses_multiple_json_ld_offers(self):
+        html = """
+        <html><head>
+          <script type="application/ld+json">
+          [
+            {
+              "@context": "https://schema.org",
+              "@type": "Product",
+              "name": "Мультиварка Redmond RMC-M52",
+              "brand": {"@type": "Brand", "name": "Redmond"},
+              "offers": {
+                "@type": "Offer",
+                "price": "29990",
+                "priceCurrency": "KZT",
+                "availability": "https://schema.org/InStock",
+                "url": "/product/1"
+              }
+            },
+            {
+              "@type": "Product",
+              "name": "Мультиварка Redmond RMC-M52",
+              "offers": {
+                "@type": "Offer",
+                "price": "25000",
+                "priceCurrency": "KZT",
+                "availability": "https://schema.org/OutOfStock"
+              }
+            }
+          ]
+          </script>
+        </head></html>
+        """
+        products = internet_compare._parse_store_page(
+            html,
+            "https://shop.kz/list",
+            "shop.kz",
+        )
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["price"], 29990)
+        self.assertEqual(
+            products[0]["url"],
+            "https://shop.kz/product/1",
+        )
+        self.assertEqual(products[0]["availability"], "В наличии")
+
+    def test_uses_product_price_meta_as_fallback(self):
+        html = """
+        <html><head>
+          <title>REDMOND RMC-M52 купить</title>
+          <meta property="product:price:amount" content="42 990">
+        </head></html>
+        """
+        products = internet_compare._parse_store_page(
+            html,
+            "https://shop.kz/product/1",
+            "shop.kz",
+        )
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["price"], 42990)
+
+
+class InternetMatchingTests(unittest.TestCase):
+    def test_accepts_exact_model_and_rejects_different_model(self):
+        ozon = {
+            "title": "REDMOND Мультиварка RMC-M52",
+            "price": 29715,
+        }
+        exact = {
+            "title": "Мультиварка Redmond RMC-M52 черная",
+            "price": 33290,
+        }
+        wrong = {
+            "title": "Мультиварка Redmond MC108",
+            "price": 25000,
+        }
+        self.assertGreaterEqual(
+            internet_compare._calculate_match_score(ozon, exact),
+            internet_compare.MATCH_THRESHOLD,
+        )
+        self.assertIsNone(
+            internet_compare._calculate_match_score(ozon, wrong)
+        )
+
+    def test_rejects_unrelated_product_without_model(self):
+        ozon = {
+            "title": "REDMOND Fast Chef MP114 Мультиварка",
+            "price": 57598,
+        }
+        unrelated = {
+            "title": "DADU 20W FAST Charge USB",
+            "price": 4990,
+        }
+        self.assertIsNone(
+            internet_compare._calculate_match_score(ozon, unrelated)
+        )
+
+    def test_selects_lowest_exact_price(self):
+        ozon = {"title": "REDMOND RMC-M52", "price": 29715}
+        candidates = [
+            {
+                "title": "REDMOND RMC-M52",
+                "price": 42990,
+                "source": "one.kz",
+            },
+            {
+                "title": "Мультиварка REDMOND RMC-M52",
+                "price": 27990,
+                "source": "two.kz",
+            },
+        ]
+        selected = internet_compare._select_candidate(ozon, candidates)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[0]["price"], 27990)
+        self.assertEqual(selected[2], 2)
+
+
+class InternetEconomicsTests(unittest.TestCase):
+    def test_calculates_with_sixteen_percent_commission(self):
+        result = internet_compare._calculate_economics(
+            {
+                "title": "REDMOND RMC-M52",
+                "price": 10000,
+                "url": "ozon",
+            },
+            {
+                "title": "REDMOND RMC-M52",
+                "price": 15000,
+                "source": "shop.kz",
+                "url": "internet",
+                "availability": "В наличии",
+            },
+            95,
+            3,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["delivery"], 950.0)
+        self.assertEqual(result["total_cost"], 10950.0)
+        self.assertEqual(result["commission_rate"], 16.0)
+        self.assertEqual(result["commission"], 2400.0)
+        self.assertEqual(result["net_revenue"], 12600.0)
+        self.assertEqual(result["profit"], 1650.0)
+        self.assertEqual(result["roi"], 15.07)
+        self.assertEqual(result["sources_count"], 3)
+
+    def test_keeps_negative_profit(self):
+        result = internet_compare._calculate_economics(
+            {"title": "REDMOND RMC-M52", "price": 20000},
+            {
+                "title": "REDMOND RMC-M52",
+                "price": 15000,
+                "source": "shop.kz",
+            },
+            90,
+            1,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["profit"], -9400.0)
+
+    def test_includes_roi_exactly_twenty_five(self):
+        total_cost = Decimal("10950")
+        internet_price = (
+            total_cost * Decimal("1.25") / Decimal("0.84")
+        )
+        result = internet_compare._calculate_economics(
+            {"title": "REDMOND RMC-M52", "price": 10000},
+            {
+                "title": "REDMOND RMC-M52",
+                "price": internet_price,
+                "source": "shop.kz",
+            },
+            90,
+            1,
+            min_roi=Decimal("25"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["roi"], 25.0)
+
+    def test_validates_commission_range(self):
+        with self.assertRaises(ValueError):
+            internet_compare._to_commission_decimal(-1)
+        with self.assertRaises(ValueError):
+            internet_compare._to_commission_decimal(100)
+        self.assertEqual(
+            internet_compare._to_commission_decimal(0),
+            Decimal("0"),
+        )
+
+
+class InternetAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compare_uses_search_pages_and_returns_result(self):
+        product = {
+            "title": "REDMOND RMC-M52",
+            "price": 10000,
+            "url": "ozon",
+        }
+        page_product = {
+            "title": "REDMOND RMC-M52",
+            "price": 20000,
+            "source": "shop.kz",
+            "url": "https://shop.kz/product",
+            "availability": "В наличии",
+        }
+        with patch(
+            "services.internet_compare.search_internet_sources",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "url": "https://shop.kz/product",
+                        "source": "shop.kz",
+                    }
+                ]
+            ),
+        ), patch(
+            "services.internet_compare._fetch_store_page",
+            new=AsyncMock(return_value=[page_product]),
+        ):
+            results = await internet_compare.compare_with_internet(
+                [product],
+                min_roi=25,
+                commission_rate=16,
+            )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["internet_price"], 20000.0)
+
+    async def test_filters_roi_below_twenty_five(self):
+        product = {
+            "title": "REDMOND RMC-M52",
+            "price": 10000,
+            "url": "ozon",
+        }
+        page_product = {
+            "title": "REDMOND RMC-M52",
+            "price": 13000,
+            "source": "shop.kz",
+            "url": "https://shop.kz/product",
+            "availability": "В наличии",
+        }
+        with patch(
+            "services.internet_compare.search_internet_sources",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "url": "https://shop.kz/product",
+                        "source": "shop.kz",
+                    }
+                ]
+            ),
+        ), patch(
+            "services.internet_compare._fetch_store_page",
+            new=AsyncMock(return_value=[page_product]),
+        ):
+            results = await internet_compare.compare_with_internet(
+                [product],
+                min_roi=25,
+                commission_rate=16,
+            )
+        self.assertEqual(results, [])
+
+
+class InternetReportAndCliTests(unittest.TestCase):
+    def test_report_contains_links_and_negative_rows(self):
+        items = [
+            {
+                "ozon_title": "REDMOND RMC-M52",
+                "internet_title": "REDMOND RMC-M52",
+                "source": "shop.kz",
+                "sources_count": 2,
+                "ozon_price": 30000,
+                "internet_price": 29000,
+                "commission_rate": 16,
+                "commission": 4640,
+                "net_revenue": 24360,
+                "delivery": 2000,
+                "total_cost": 32000,
+                "price_difference": -1000,
+                "profit": -7640,
+                "roi": -23.88,
+                "match_score": 95,
+                "availability": "В наличии",
+                "ozon_url": "https://ozon.kz/product/1",
+                "internet_url": "https://shop.kz/product/1",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "services.report.REPORTS_DIR",
+                Path(temp_dir),
+            ):
+                report_path = save_internet_comparison_report(items)
+                workbook = load_workbook(report_path)
+                sheet = workbook.active
+
+        self.assertEqual(
+            [cell.value for cell in sheet[1]],
+            [title for title, _ in INTERNET_REPORT_COLUMNS],
+        )
+        self.assertEqual(sheet["P2"].value, -7640)
+        self.assertEqual(
+            sheet["T2"].hyperlink.target,
+            items[0]["ozon_url"],
+        )
+        self.assertEqual(
+            sheet["U2"].hyperlink.target,
+            items[0]["internet_url"],
+        )
+
+    def test_cli_calls_internet_services(self):
+        products = [{"title": "Товар", "price": 10000}]
+        items = [{"profit": 5000}]
+        with patch(
+            "services.internet_compare.compare_with_internet",
+            new=AsyncMock(return_value=items),
+        ) as compare_mock, patch(
+            "services.report.save_internet_comparison_report",
+            return_value="reports/internet.xlsx",
+        ) as report_mock:
+            count, path = run_internet_comparison(
+                ozon_products=products,
+                min_roi=25,
+                commission_rate=16,
+            )
+        self.assertEqual(count, 1)
+        self.assertEqual(path, "reports/internet.xlsx")
+        compare_mock.assert_awaited_once_with(
+            products,
+            min_roi=25,
+            commission_rate=16,
+        )
+        report_mock.assert_called_once_with(items)
+
+
+if __name__ == "__main__":
+    unittest.main()
