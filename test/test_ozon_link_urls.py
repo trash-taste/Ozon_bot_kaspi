@@ -3,7 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.parsers.link_parser import OzonLinkParser
-from src.parsers.product_parser import OzonProductParser
+from src.parsers.product_parser import (
+    OzonProductParser,
+    extract_product_page_fallback,
+)
 from src.parsers.seller_parser import OzonSellerParser
 
 
@@ -47,6 +50,34 @@ class OzonProductURLTests(unittest.TestCase):
 
 
 class OzonProductWorkerTests(unittest.TestCase):
+    def test_extracts_title_price_and_image_from_json_ld(self):
+        html = """
+        <html><head>
+          <meta property="og:title" content="REDMOND RMC-M52">
+          <meta property="og:image" content="https://img.test/item.jpg">
+          <script type="application/ld+json">
+          {
+            "@type": "Product",
+            "name": "REDMOND RMC-M52",
+            "offers": {
+              "@type": "Offer",
+              "price": "34 990",
+              "priceCurrency": "KZT"
+            }
+          }
+          </script>
+        </head></html>
+        """
+
+        result = extract_product_page_fallback(html)
+
+        self.assertEqual(result["title"], "REDMOND RMC-M52")
+        self.assertEqual(result["prices"], [34990])
+        self.assertEqual(
+            result["image_url"],
+            "https://img.test/item.jpg",
+        )
+
     def test_uses_at_most_two_product_workers_by_default(self):
         parser = OzonProductParser(max_workers=10, user_id="123")
         product_links = {

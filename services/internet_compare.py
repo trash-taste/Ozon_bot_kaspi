@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -20,6 +21,15 @@ SEARCH_RETRIES = 3
 PAGE_RETRIES = 2
 MAX_SEARCH_RESULTS = 12
 MAX_CONCURRENT_PAGES = 4
+MAX_CONCURRENT_PRODUCTS = int(
+    os.getenv("INTERNET_PRODUCT_CONCURRENCY", "2")
+)
+REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv("INTERNET_REQUEST_TIMEOUT", "15")
+)
+PRODUCT_TIMEOUT_SECONDS = float(
+    os.getenv("INTERNET_PRODUCT_TIMEOUT", "60")
+)
 MONEY_QUANT = Decimal("0.01")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -529,13 +539,15 @@ async def _compare_one(
 ) -> dict[str, Any] | None:
     query = _build_search_query(product)
     search_results = await search_internet_sources(session, query)
-    if not search_results:
-        return None
-    pages = await asyncio.gather(
-        *(
-            _fetch_store_page(session, semaphore, result)
-            for result in search_results
+    pages = (
+        await asyncio.gather(
+            *(
+                _fetch_store_page(session, semaphore, result)
+                for result in search_results
+            )
         )
+        if search_results
+        else []
     )
     candidates = [
         candidate
@@ -543,6 +555,27 @@ async def _compare_one(
         for candidate in page_candidates
     ]
     selected = _select_candidate(product, candidates)
+    if selected is None:
+        try:
+            from services.kaspi_compare import search_kaspi_product
+
+            kaspi_candidates = await search_kaspi_product(
+                str(product.get("title") or "")
+            )
+            candidates = [
+                {
+                    **candidate,
+                    "source": "kaspi.kz",
+                    "availability": "В наличии",
+                }
+                for candidate in kaspi_candidates
+            ]
+            selected = _select_candidate(product, candidates)
+        except Exception:
+            logger.exception(
+                "Ошибка резервного поиска Kaspi: %s",
+                product.get("title"),
+            )
     if selected is None:
         return None
     internet_product, score, sources_count = selected
@@ -581,18 +614,19 @@ async def compare_with_internet(
         "Комиссия интернет-сравнения: %s%%",
         commission_decimal,
     )
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "ru-RU,ru;q=0.9",
     }
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
-    results: list[dict[str, Any]] = []
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        headers=headers,
-    ) as session:
-        for index, product in enumerate(ozon_products, 1):
+    page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+    product_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PRODUCTS)
+
+    async def compare_one_product(
+        index: int,
+        product: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        async with product_semaphore:
             logger.info(
                 "Интернет-поиск %s/%s: %s",
                 index,
@@ -600,22 +634,41 @@ async def compare_with_internet(
                 product.get("title"),
             )
             try:
-                item = await _compare_one(
-                    session,
-                    semaphore,
-                    product,
-                    min_roi_decimal,
-                    commission_decimal,
+                return await asyncio.wait_for(
+                    _compare_one(
+                        session,
+                        page_semaphore,
+                        product,
+                        min_roi_decimal,
+                        commission_decimal,
+                    ),
+                    timeout=PRODUCT_TIMEOUT_SECONDS,
                 )
-                if item is not None:
-                    results.append(item)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Таймаут интернет-поиска товара после %s сек: %s",
+                    PRODUCT_TIMEOUT_SECONDS,
+                    product.get("title"),
+                )
             except Exception:
                 logger.exception(
                     "Ошибка интернет-сравнения: %s",
                     product.get("title"),
                 )
-            if index < len(ozon_products):
-                await asyncio.sleep(1)
+            return None
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers,
+    ) as session:
+        compared = await asyncio.gather(
+            *(
+                compare_one_product(index, product)
+                for index, product in enumerate(ozon_products, 1)
+            )
+        )
+
+    results = [item for item in compared if item is not None]
 
     results.sort(
         key=lambda item: (item["roi"], item["profit"]),

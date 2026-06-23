@@ -239,15 +239,15 @@ class AppManager:
             self.last_results = user_results
             
             self._save_results_to_file(user_id)
-            excel_sent = self._export_to_excel(user_id)
-            if self.telegram_bot and user_id and not excel_sent:
+            excel_created = self._export_to_excel(user_id)
+            if self.telegram_bot and user_id and not excel_created:
                 self._notify_user(
                     user_id,
-                    "Excel создать или отправить в Telegram не удалось. "
+                    "Не удалось создать технический Ozon-отчет. "
                     "Проверьте logs и папку output.",
                 )
             if self.telegram_bot and user_id:
-                self._compare_with_kaspi_and_send(user_id)
+                self._compare_with_internet_and_send(user_id)
             if self.telegram_bot and user_id:
                 self._send_report_to_telegram(user_id)
             
@@ -334,7 +334,11 @@ class AppManager:
         except Exception as e:
             logger.error(f"Ошибка сохранения результатов: {e}")
     
-    def _export_to_excel(self, user_id: str = None) -> bool:
+    def _export_to_excel(
+        self,
+        user_id: str = None,
+        send_to_telegram: bool = False,
+    ) -> bool:
         try:
             # Получаем результаты для конкретного пользователя
             results = self.user_results.get(user_id, self.last_results) if user_id else self.last_results
@@ -398,7 +402,7 @@ class AppManager:
                 exporter.filepath.resolve(),
                 file_size,
             )
-            if self.telegram_bot and user_id:
+            if send_to_telegram and self.telegram_bot and user_id:
                 return self._send_files_to_telegram(
                     str(exporter.filepath),
                     user_id,
@@ -496,6 +500,78 @@ class AppManager:
                 "Не удалось завершить сравнение с Kaspi. "
                 "Ozon-отчет уже сохранен.",
             )
+
+    def _compare_with_internet_and_send(self, user_id: str):
+        try:
+            from services.internet_compare import compare_with_internet
+            from services.report import save_internet_comparison_report
+
+            ozon_products = self._build_ozon_products_for_comparison(user_id)
+            logger.info(
+                "Запуск интернет-сравнения для пользователя %s: "
+                "%s товаров",
+                user_id,
+                len(ozon_products),
+            )
+            if not ozon_products:
+                self._notify_user(
+                    user_id,
+                    "Не удалось получить названия и цены товаров Ozon. "
+                    "Итоговый отчет не создан.",
+                )
+                return False
+
+            self._notify_user(
+                user_id,
+                "Ищу цены в интернет-магазинах Казахстана. "
+                "Комиссия: 16%.",
+            )
+            comparison_items = asyncio.run(
+                compare_with_internet(
+                    ozon_products,
+                    min_roi=None,
+                    commission_rate=16,
+                )
+            )
+            if not comparison_items:
+                logger.warning(
+                    "Интернет-сравнение не нашло точных совпадений: "
+                    "user=%s products=%s",
+                    user_id,
+                    len(ozon_products),
+                )
+                self._notify_user(
+                    user_id,
+                    "Точные совпадения цен в интернете не найдены. "
+                    "Пустой Excel не отправляю.",
+                )
+                return False
+
+            report_path = save_internet_comparison_report(
+                comparison_items
+            )
+            caption = (
+                "Сравнение с интернет-магазинами завершено.\n"
+                f"Точных совпадений: {len(comparison_items)}.\n"
+                "Комиссия: 16%. В файле показаны прибыль и ROI."
+            )
+            return self._send_files_to_telegram(
+                report_path,
+                user_id,
+                caption=caption,
+            )
+        except Exception as e:
+            logger.exception(
+                "Ошибка интернет-сравнения для пользователя %s: %s",
+                user_id,
+                e,
+            )
+            self._notify_user(
+                user_id,
+                "Не удалось завершить поиск интернет-цен. "
+                "Подробности записаны в logs.",
+            )
+            return False
     
     def start_telegram_bot(self, bot_token: str, user_ids) -> bool:
         try:

@@ -237,6 +237,38 @@ class InternetEconomicsTests(unittest.TestCase):
 
 
 class InternetAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_kaspi_as_fallback_internet_source(self):
+        product = {
+            "title": "REDMOND RMC-M52",
+            "price": 10000,
+            "url": "ozon",
+        }
+        with patch(
+            "services.internet_compare.search_internet_sources",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "services.kaspi_compare.search_kaspi_product",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "title": "Мультиварка REDMOND RMC-M52",
+                        "price": 20000,
+                        "url": "https://kaspi.kz/shop/p/1",
+                        "brand": "REDMOND",
+                        "article": None,
+                    }
+                ]
+            ),
+        ):
+            results = await internet_compare.compare_with_internet(
+                [product],
+                commission_rate=16,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "kaspi.kz")
+        self.assertEqual(results[0]["commission"], 3200.0)
+
     async def test_compare_uses_search_pages_and_returns_result(self):
         product = {
             "title": "REDMOND RMC-M52",

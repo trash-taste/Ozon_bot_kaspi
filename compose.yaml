@@ -17,6 +17,9 @@ services:
       OZON_SELLER_WORKERS: "2"
       KASPI_REQUEST_TIMEOUT: "12"
       KASPI_COMPARE_TIMEOUT: "180"
+      INTERNET_REQUEST_TIMEOUT: "15"
+      INTERNET_PRODUCT_TIMEOUT: "60"
+      INTERNET_PRODUCT_CONCURRENCY: "2"
     volumes:
       - ./config.txt:/app/config.txt
       - ./output:/app/output

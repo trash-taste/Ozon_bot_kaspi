@@ -5,14 +5,114 @@ import os
 import re
 import time
 import concurrent.futures
+from html import unescape
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from ..utils.selenium_manager import SeleniumManager
 from ..utils.resource_manager import resource_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _walk_json_ld_products(value) -> List[Dict]:
+    products = []
+    if isinstance(value, list):
+        for item in value:
+            products.extend(_walk_json_ld_products(item))
+        return products
+    if not isinstance(value, dict):
+        return products
+
+    value_type = value.get("@type")
+    types = value_type if isinstance(value_type, list) else [value_type]
+    if any(str(item).casefold() == "product" for item in types):
+        products.append(value)
+    for child in value.values():
+        if isinstance(child, (dict, list)):
+            products.extend(_walk_json_ld_products(child))
+    return products
+
+
+def extract_product_page_fallback(page_source: str) -> Dict[str, object]:
+    """Извлекает карточку из meta и JSON-LD при изменении DOM Ozon."""
+    soup = BeautifulSoup(page_source or "", "html.parser")
+    title = ""
+    image_url = ""
+    prices: List[int] = []
+
+    heading = soup.select_one("h1")
+    if heading:
+        title = heading.get_text(" ", strip=True)
+
+    if not title:
+        title_meta = soup.select_one(
+            'meta[property="og:title"], meta[name="title"]'
+        )
+        if title_meta:
+            title = str(title_meta.get("content") or "").strip()
+    if not title and soup.title:
+        title = soup.title.get_text(" ", strip=True)
+
+    image_meta = soup.select_one('meta[property="og:image"]')
+    if image_meta:
+        image_url = str(image_meta.get("content") or "").strip()
+
+    price_meta = soup.select_one(
+        'meta[property="product:price:amount"],'
+        'meta[itemprop="price"],'
+        '[itemprop="price"][content]'
+    )
+    if price_meta:
+        raw_price = str(price_meta.get("content") or "")
+        cleaned = re.sub(r"[^\d]", "", raw_price)
+        if cleaned:
+            prices.append(int(cleaned))
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        raw_json = script.string or script.get_text()
+        if not raw_json.strip():
+            continue
+        try:
+            payload = json.loads(unescape(raw_json))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for product in _walk_json_ld_products(payload):
+            if not title:
+                title = str(product.get("name") or "").strip()
+            if not image_url:
+                image = product.get("image")
+                if isinstance(image, list):
+                    image = image[0] if image else ""
+                if isinstance(image, dict):
+                    image = image.get("url")
+                image_url = str(image or "").strip()
+
+            offers = product.get("offers")
+            if isinstance(offers, dict):
+                offers = [offers]
+            if not isinstance(offers, list):
+                continue
+            for offer in offers:
+                if not isinstance(offer, dict):
+                    continue
+                for key in ("price", "lowPrice", "salePrice"):
+                    cleaned = re.sub(
+                        r"[^\d]",
+                        "",
+                        str(offer.get(key) or ""),
+                    )
+                    if cleaned:
+                        prices.append(int(cleaned))
+
+    return {
+        "title": re.sub(r"\s+", " ", unescape(title)).strip(),
+        "image_url": image_url,
+        "prices": list(dict.fromkeys(price for price in prices if price > 0)),
+    }
+
 
 @dataclass
 class ProductInfo:
@@ -96,7 +196,14 @@ class ProductWorker:
                     return ProductInfo(article=article, error="Не удалось загрузить карточку товара")
 
                 WebDriverWait(self.driver, 10).until(
-                    lambda driver: driver.find_elements(By.CSS_SELECTOR, "h1")
+                    lambda driver: (
+                        driver.find_elements(By.CSS_SELECTOR, "h1")
+                        or driver.find_elements(
+                            By.CSS_SELECTOR,
+                            'meta[property="og:title"]',
+                        )
+                        or driver.title
+                    )
                 )
 
                 product_info = self._parse_product_page(article)
@@ -156,8 +263,29 @@ class ProductWorker:
                 if len(prices) > 1 and prices[1] > prices[0]:
                     product_info.original_price = prices[1]
 
-            if product_info.name:
+            fallback = extract_product_page_fallback(
+                self.driver.page_source
+            )
+            if not product_info.name:
+                product_info.name = self._fix_text_encoding(
+                    str(fallback["title"])
+                )
+            if not product_info.image_url:
+                product_info.image_url = str(fallback["image_url"])
+            if not product_info.price and fallback["prices"]:
+                fallback_prices = fallback["prices"]
+                product_info.card_price = fallback_prices[0]
+                product_info.price = fallback_prices[0]
+                if (
+                    len(fallback_prices) > 1
+                    and fallback_prices[1] > fallback_prices[0]
+                ):
+                    product_info.original_price = fallback_prices[1]
+
+            if product_info.name and product_info.price:
                 product_info.success = True
+            elif product_info.name:
+                product_info.error = "Не найдена цена товара в карточке"
             else:
                 product_info.error = "Не найдено название товара в карточке"
 

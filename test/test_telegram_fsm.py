@@ -180,10 +180,87 @@ class TelegramKaspiIntegrationTests(unittest.TestCase):
             "src.core.app_manager.ExcelExporter",
             return_value=exporter,
         ):
-            result = app_manager._export_to_excel("123")
+            result = app_manager._export_to_excel(
+                "123",
+                send_to_telegram=True,
+            )
 
         self.assertTrue(result)
         app_manager._send_files_to_telegram.assert_called_once()
+
+    def test_technical_excel_is_not_sent_by_default(self):
+        app_manager = AppManager.__new__(AppManager)
+        app_manager.settings = SimpleNamespace(
+            OUTPUT_DIR=MagicMock()
+        )
+        app_manager.telegram_bot = SimpleNamespace(bot_token="token")
+        app_manager.last_results = {}
+        app_manager.user_results = {
+            "123": {
+                "output_folder": "test",
+                "selected_fields": ["name"],
+                "links": {},
+                "products": [],
+                "seller_data": {},
+            }
+        }
+        app_manager._send_files_to_telegram = Mock(return_value=True)
+        exporter = MagicMock()
+        exporter.export_results.return_value = True
+        exporter.filepath.stat.return_value.st_size = 128
+        exporter.filepath.resolve.return_value = "/tmp/report.xlsx"
+
+        with patch(
+            "src.core.app_manager.ExcelExporter",
+            return_value=exporter,
+        ):
+            result = app_manager._export_to_excel("123")
+
+        self.assertTrue(result)
+        app_manager._send_files_to_telegram.assert_not_called()
+
+    def test_internet_report_replaces_automatic_kaspi_report(self):
+        app_manager = AppManager.__new__(AppManager)
+        app_manager.last_results = {}
+        app_manager.user_results = {}
+        app_manager._build_ozon_products_for_comparison = Mock(
+            return_value=[
+                {
+                    "title": "REDMOND RMC-M52",
+                    "price": 30000,
+                    "url": "https://ozon.kz/product/1",
+                }
+            ]
+        )
+        app_manager._notify_user = Mock()
+        app_manager._send_files_to_telegram = Mock(return_value=True)
+        items = [{"roi": 10, "profit": 3000}]
+
+        with (
+            patch(
+                "services.internet_compare.compare_with_internet",
+                new=AsyncMock(return_value=items),
+            ) as compare_mock,
+            patch(
+                "services.report.save_internet_comparison_report",
+                return_value="/tmp/internet.xlsx",
+            ) as report_mock,
+        ):
+            result = app_manager._compare_with_internet_and_send("123")
+
+        self.assertTrue(result)
+        compare_mock.assert_awaited_once_with(
+            app_manager._build_ozon_products_for_comparison.return_value,
+            min_roi=None,
+            commission_rate=16,
+        )
+        report_mock.assert_called_once_with(items)
+        send_call = app_manager._send_files_to_telegram.call_args
+        self.assertEqual(
+            send_call.args[:2],
+            ("/tmp/internet.xlsx", "123"),
+        )
+        self.assertIn("Комиссия: 16%", send_call.kwargs["caption"])
 
 
 if __name__ == "__main__":
