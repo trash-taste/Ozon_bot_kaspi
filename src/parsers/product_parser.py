@@ -713,7 +713,10 @@ class OzonProductParser:
         self.results: List[ProductInfo] = []
         logger.info(f"Парсер товаров инициализирован с макс {max_workers} воркерами для пользователя {user_id}")
     
-    def parse_products(self, product_links: Dict[str, str]) -> List[ProductInfo]:
+    def parse_products(
+        self,
+        product_links: Dict[str, Any],
+    ) -> List[ProductInfo]:
         # Сохраняем ссылки для использования в воркерах
         self.product_links = product_links
         
@@ -726,14 +729,53 @@ class OzonProductParser:
         if not articles:
             logger.error("Не найдено артикулов для парсинга")
             return []
+
+        listing_results = self._parse_products_from_listing(
+            product_links,
+            articles,
+        )
+        complete_listing_results = [
+            product for product in listing_results if product.success
+        ]
+        if len(complete_listing_results) == len(articles):
+            logger.info(
+                "Все %s товаров получены из карточек категории Ozon, "
+                "переходы в карточки товаров пропущены",
+                len(articles),
+            )
+            return listing_results
+
+        listing_result_by_article = {
+            product.article: product
+            for product in listing_results
+            if product.success
+        }
+        articles_to_parse = [
+            article
+            for article in articles
+            if article not in listing_result_by_article
+        ]
+        if listing_result_by_article:
+            logger.info(
+                "Переходы в карточки Ozon нужны только для %s/%s товаров",
+                len(articles_to_parse),
+                len(articles),
+            )
+            self.product_links = {
+                url: payload
+                for url, payload in product_links.items()
+                if self._extract_article_from_url(url) in articles_to_parse
+            }
         
         # Получаем количество воркеров от менеджера ресурсов
         if self.user_id:
             allocated_workers = resource_manager.start_parsing_session(
-                self.user_id, 'products', len(articles)
+                self.user_id, 'products', len(articles_to_parse)
             )
         else:
-            allocated_workers = self._calculate_optimal_workers(len(articles))
+            allocated_workers = self._calculate_optimal_workers(
+                len(articles_to_parse)
+            )
 
         worker_limit = max(
             1,
@@ -743,15 +785,34 @@ class OzonProductParser:
             allocated_workers,
             self.max_workers,
             worker_limit,
-            len(articles),
+            len(articles_to_parse),
         )
         
-        logger.info(f"Начало парсинга {len(articles)} товаров с {allocated_workers} воркерами для пользователя {self.user_id}")
+        logger.info(
+            f"Начало парсинга {len(articles_to_parse)} товаров "
+            f"с {allocated_workers} воркерами для пользователя {self.user_id}"
+        )
         
         if allocated_workers == 1:
-            return self._parse_single_worker(articles)
+            parsed_results = self._parse_single_worker(articles_to_parse)
         else:
-            return self._parse_multiple_workers(articles, allocated_workers)
+            parsed_results = self._parse_multiple_workers(
+                articles_to_parse,
+                allocated_workers,
+            )
+
+        if not listing_result_by_article:
+            return parsed_results
+
+        parsed_result_by_article = {
+            product.article: product for product in parsed_results
+        }
+        return [
+            listing_result_by_article.get(article)
+            or parsed_result_by_article.get(article)
+            or ProductInfo(article=article, error="Не обработан")
+            for article in articles
+        ]
     
     def _extract_article_from_url(self, url: str) -> str:
         try:
@@ -759,6 +820,64 @@ class OzonProductParser:
             return match.group(1) if match else ""
         except Exception:
             return ""
+
+    def _parse_products_from_listing(
+        self,
+        product_links: Dict[str, Any],
+        articles: List[str],
+    ) -> List[ProductInfo]:
+        metadata_by_article: Dict[str, Dict[str, Any]] = {}
+        for url, payload in product_links.items():
+            article = self._extract_article_from_url(url)
+            if not article:
+                continue
+            metadata_by_article[article] = self._normalize_listing_metadata(
+                payload,
+            )
+
+        results = []
+        for article in articles:
+            metadata = metadata_by_article.get(article, {})
+            title = str(metadata.get("title") or "").strip()
+            price = int(metadata.get("price") or 0)
+            image_url = str(metadata.get("image_url") or "")
+            if title and price:
+                results.append(
+                    ProductInfo(
+                        article=article,
+                        name=title,
+                        image_url=image_url,
+                        card_price=price,
+                        price=price,
+                        success=True,
+                    )
+                )
+            else:
+                results.append(
+                    ProductInfo(
+                        article=article,
+                        image_url=image_url,
+                        error="Нет названия или цены в карточке категории",
+                    )
+                )
+
+        successful = len([product for product in results if product.success])
+        logger.info(
+            "Из карточек категории Ozon получено товаров с названием и ценой: "
+            "%s/%s",
+            successful,
+            len(results),
+        )
+        return results
+
+    def _normalize_listing_metadata(self, payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, dict):
+            return {
+                "image_url": str(payload.get("image_url") or ""),
+                "title": str(payload.get("title") or ""),
+                "price": _extract_price_number(payload.get("price")),
+            }
+        return {"image_url": str(payload or ""), "title": "", "price": 0}
     
     def _parse_single_worker(self, articles: List[str]) -> List[ProductInfo]:
         worker = ProductWorker(1, headless=self.headless)

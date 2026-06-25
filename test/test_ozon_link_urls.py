@@ -150,6 +150,66 @@ class OzonProductWorkerTests(unittest.TestCase):
         self.assertEqual(product.name, "REDMOND RMC-M52 мультиварка")
         self.assertTrue(product.success)
 
+    def test_product_parser_skips_product_pages_when_listing_has_all_data(self):
+        parser = OzonProductParser(max_workers=2)
+        product_links = {
+            "https://ozon.kz/product/test-10001/": {
+                "title": "REDMOND RMC-M52",
+                "price": 34990,
+                "image_url": "https://img.test/1.jpg",
+            },
+            "https://ozon.kz/product/test-10002/": {
+                "title": "REDMOND RK-G196",
+                "price": 12990,
+                "image_url": "https://img.test/2.jpg",
+            },
+        }
+
+        with (
+            patch.object(parser, "_parse_single_worker") as parse_single,
+            patch.object(parser, "_parse_multiple_workers") as parse_multiple,
+        ):
+            results = parser.parse_products(product_links)
+
+        parse_single.assert_not_called()
+        parse_multiple.assert_not_called()
+        self.assertEqual([product.article for product in results], ["10001", "10002"])
+        self.assertTrue(all(product.success for product in results))
+        self.assertEqual(results[0].name, "REDMOND RMC-M52")
+        self.assertEqual(results[0].price, 34990)
+
+    def test_product_parser_opens_only_items_missing_listing_data(self):
+        parser = OzonProductParser(max_workers=2)
+        product_links = {
+            "https://ozon.kz/product/test-10001/": {
+                "title": "REDMOND RMC-M52",
+                "price": 34990,
+            },
+            "https://ozon.kz/product/test-10002/": {
+                "title": "",
+                "price": 0,
+            },
+        }
+        parsed_missing = ProductInfo(
+            article="10002",
+            name="REDMOND RK-G196",
+            price=12990,
+            card_price=12990,
+            success=True,
+        )
+
+        with patch.object(
+            parser,
+            "_parse_single_worker",
+            return_value=[parsed_missing],
+        ) as parse_single:
+            results = parser.parse_products(product_links)
+
+        parse_single.assert_called_once_with(["10002"])
+        self.assertEqual([product.article for product in results], ["10001", "10002"])
+        self.assertEqual(results[0].name, "REDMOND RMC-M52")
+        self.assertEqual(results[1].name, "REDMOND RK-G196")
+
     def test_uses_at_most_two_product_workers_by_default(self):
         parser = OzonProductParser(max_workers=10, user_id="123")
         product_links = {
