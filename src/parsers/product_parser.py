@@ -9,8 +9,10 @@ from html import unescape
 from typing import Any, List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
+import requests
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from urllib.parse import urlencode, urlsplit
 from ..utils.selenium_manager import SeleniumManager
 from ..utils.resource_manager import resource_manager
 
@@ -313,11 +315,16 @@ class ProductWorker:
     
     def initialize(self):
         try:
-            self.driver = self.selenium_manager.create_driver()
-            logger.info(f"Воркер {self.worker_id} готов к работе")
+            self._ensure_driver()
         except Exception as e:
             logger.error(f"Ошибка инициализации воркера {self.worker_id}: {e}")
             raise
+
+    def _ensure_driver(self):
+        if self.driver:
+            return
+        self.driver = self.selenium_manager.create_driver()
+        logger.info(f"Воркер {self.worker_id} готов к работе")
     
     def parse_products(self, articles: List[str], product_links: Dict[str, Any]) -> List[ProductInfo]:
         results = []
@@ -377,6 +384,15 @@ class ProductWorker:
                         "Не найдена ссылка товара",
                     )
 
+                api_product_info = self._parse_product_api(
+                    article,
+                    product_url,
+                )
+                self._apply_link_metadata(api_product_info, link_metadata)
+                if api_product_info.success:
+                    return api_product_info
+
+                self._ensure_driver()
                 if not self.selenium_manager.navigate_to_url(product_url):
                     if attempt < max_retries - 1:
                         time.sleep(5)
@@ -426,6 +442,136 @@ class ProductWorker:
                     )
         
         return ProductInfo(article=article, error="Превышено количество попыток")
+
+    def _parse_product_api(
+        self,
+        article: str,
+        product_url: str,
+    ) -> ProductInfo:
+        last_error = ""
+
+        json_content = self._fetch_product_api_json_http(product_url)
+        if json_content:
+            product_info = self._parse_json_response(article, json_content)
+            if product_info.success:
+                logger.info("Товар %s получен через Ozon composer API", article)
+                return product_info
+            last_error = product_info.error
+
+        if os.getenv("OZON_PRODUCT_API_SELENIUM", "1") != "0":
+            json_content = self._fetch_product_api_json_browser(product_url)
+            if json_content:
+                product_info = self._parse_json_response(article, json_content)
+                if product_info.success:
+                    logger.info(
+                        "Товар %s получен через Ozon composer API в браузере",
+                        article,
+                    )
+                    return product_info
+                last_error = product_info.error
+
+        return ProductInfo(
+            article=article,
+            error=last_error or "Не получен JSON Ozon composer API",
+        )
+
+    def _fetch_product_api_json_http(self, product_url: str) -> str:
+        api_url = self._build_product_api_url(product_url)
+        if not api_url:
+            return ""
+
+        try:
+            response = requests.get(
+                api_url,
+                headers=self._build_product_api_headers(product_url),
+                timeout=float(os.getenv("OZON_PRODUCT_API_TIMEOUT", "12")),
+            )
+            if response.status_code != 200:
+                logger.debug(
+                    "Ozon composer API HTTP %s: %s",
+                    response.status_code,
+                    api_url,
+                )
+                return ""
+            return self._extract_json_content(response.text)
+        except requests.RequestException as exc:
+            logger.debug("Ozon composer API HTTP error: %s", exc)
+            return ""
+
+    def _fetch_product_api_json_browser(self, product_url: str) -> str:
+        api_url = self._build_product_api_url(product_url)
+        if not api_url:
+            return ""
+
+        try:
+            self._ensure_driver()
+            if not self.selenium_manager.navigate_to_url(api_url):
+                return ""
+            return self.selenium_manager.wait_for_json_response(
+                timeout=int(os.getenv("OZON_PRODUCT_API_BROWSER_TIMEOUT", "15"))
+            ) or ""
+        except Exception as exc:
+            logger.debug("Ozon composer API browser error: %s", exc)
+            return ""
+
+    def _build_product_api_url(self, product_url: str) -> str:
+        try:
+            parsed = urlsplit(product_url)
+        except ValueError:
+            return ""
+
+        host = (parsed.hostname or "").casefold()
+        if host not in {"ozon.ru", "www.ozon.ru", "ozon.kz", "www.ozon.kz"}:
+            return ""
+
+        product_path = parsed.path
+        if parsed.query:
+            product_path = f"{product_path}?{parsed.query}"
+
+        api_host = "www.ozon.kz" if host.endswith("ozon.kz") else "www.ozon.ru"
+        params = urlencode(
+            {
+                "url": product_path,
+                "layout_container": "pdpPage2column",
+                "layout_page_index": "2",
+            }
+        )
+        return f"https://{api_host}/api/composer-api.bx/page/json/v2?{params}"
+
+    def _build_product_api_headers(self, product_url: str) -> Dict[str, str]:
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Referer": product_url,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        }
+
+    def _extract_json_content(self, raw_content: str) -> str:
+        text = unescape(raw_content or "").strip()
+        if not text:
+            return ""
+
+        if text.startswith("{") and text.endswith("}"):
+            return text
+
+        pre_match = re.search(
+            r"<pre[^>]*>(.*?)</pre>",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if pre_match:
+            return unescape(pre_match.group(1)).strip()
+
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+            return text[first_brace:last_brace + 1]
+
+        return ""
 
     def _normalize_link_metadata(self, payload: Any) -> Dict[str, Any]:
         if isinstance(payload, dict):
@@ -625,8 +771,16 @@ class ProductWorker:
             # Ищем информацию о товаре в webStickyProducts
             sticky_product_data = self._find_sticky_product_data(widget_states)
             if sticky_product_data:
-                product_info.name = sticky_product_data.get('name', '')
-                product_info.image_url = sticky_product_data.get('coverImageUrl', '')
+                titles = _extract_titles_from_json(sticky_product_data)
+                product_info.name = (
+                    sticky_product_data.get('name', '')
+                    or sticky_product_data.get('title', '')
+                    or (titles[0] if titles else '')
+                )
+                product_info.image_url = (
+                    sticky_product_data.get('coverImageUrl', '')
+                    or sticky_product_data.get('imageUrl', '')
+                )
                 
                 # Информация о продавце
                 seller_info = sticky_product_data.get('seller', {})
@@ -656,7 +810,7 @@ class ProductWorker:
                     product_info.seller_link = f"https://ozon.ru/seller/{seller_matches[0]}"
                     logger.info(f"Найден seller_id через резервный поиск для товара {article}: {product_info.seller_id} (всего найдено: {len(seller_matches)})")
                 else:
-                    logger.warning(f"seller_id не найден ни в sticky_product_data, ни в резервном поиске для товара {article}")
+                    logger.debug(f"seller_id не найден ни в sticky_product_data, ни в резервном поиске для товара {article}")
             
             # Ищем информацию о ценах в webPrice
             price_data = self._find_price_data(widget_states)
@@ -664,10 +818,37 @@ class ProductWorker:
                 product_info.card_price = self._extract_price_number(price_data.get('cardPrice', ''))
                 product_info.price = self._extract_price_number(price_data.get('price', ''))
                 product_info.original_price = self._extract_price_number(price_data.get('originalPrice', ''))
+
+            if not product_info.name:
+                titles = []
+                for value in widget_states.values():
+                    decoded = self._decode_widget_state(value)
+                    if decoded:
+                        titles.extend(_extract_titles_from_json(decoded))
+                if titles:
+                    product_info.name = titles[0]
+
+            if not product_info.image_url:
+                product_info.image_url = self._find_image_url(widget_states)
+
+            if not product_info.price:
+                prices = []
+                for value in widget_states.values():
+                    decoded = self._decode_widget_state(value)
+                    if decoded:
+                        prices.extend(_extract_prices_from_json(decoded))
+                prices = list(dict.fromkeys(price for price in prices if price))
+                if prices:
+                    product_info.card_price = prices[0]
+                    product_info.price = prices[0]
+                    if len(prices) > 1 and prices[1] > prices[0]:
+                        product_info.original_price = prices[1]
             
             # Проверяем, что получили основную информацию
-            if product_info.name or product_info.card_price:
+            if product_info.name and product_info.price:
                 product_info.success = True
+            elif product_info.name or product_info.card_price:
+                product_info.error = "Неполные данные товара в JSON Ozon"
             else:
                 product_info.error = "Не найдена основная информация о товаре"
             
@@ -681,20 +862,39 @@ class ProductWorker:
     def _find_sticky_product_data(self, widget_states: Dict) -> Optional[Dict]:
         for key, value in widget_states.items():
             if key.startswith('webStickyProducts-') and isinstance(value, str):
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    continue
+                decoded = self._decode_widget_state(value)
+                if decoded:
+                    return decoded
         return None
     
     def _find_price_data(self, widget_states: Dict) -> Optional[Dict]:
         for key, value in widget_states.items():
             if key.startswith('webPrice-') and isinstance(value, str):
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    continue
+                decoded = self._decode_widget_state(value)
+                if decoded:
+                    return decoded
         return None
+
+    def _decode_widget_state(self, value: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            return None
+        return _decode_ozon_json_string(value)
+
+    def _find_image_url(self, widget_states: Dict) -> str:
+        for value in widget_states.values():
+            decoded = self._decode_widget_state(value)
+            if not decoded:
+                continue
+            for item in _walk_json_values(decoded):
+                for key in ("coverImageUrl", "imageUrl", "image", "url"):
+                    image_value = item.get(key)
+                    if isinstance(image_value, str) and image_value.startswith(
+                        ("http://", "https://", "//")
+                    ):
+                        return image_value
+        return ""
     
     def _extract_price_number(self, price_str: str) -> int:
         return _extract_price_number(price_str)
@@ -882,7 +1082,6 @@ class OzonProductParser:
     def _parse_single_worker(self, articles: List[str]) -> List[ProductInfo]:
         worker = ProductWorker(1, headless=self.headless)
         try:
-            worker.initialize()
             return worker.parse_products(articles, self.product_links)
         finally:
             worker.close()
@@ -940,7 +1139,6 @@ class OzonProductParser:
         for attempt in range(max_worker_retries):
             worker = ProductWorker(worker_id, headless=self.headless)
             try:
-                worker.initialize()
                 results = worker.parse_products(articles, self.product_links)
                 return results
             except Exception as e:

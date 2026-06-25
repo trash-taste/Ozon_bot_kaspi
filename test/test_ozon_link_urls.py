@@ -220,6 +220,58 @@ class OzonProductWorkerTests(unittest.TestCase):
         self.assertEqual(product.price, 34990)
         self.assertEqual(product.image_url, "https://img.test/item.jpg")
 
+    def test_product_worker_builds_kazakhstan_composer_api_url(self):
+        worker = ProductWorker(1)
+
+        api_url = worker._build_product_api_url(
+            "https://ozon.kz/product/redmond-rmc-m52-4103859568/?from=share"
+        )
+
+        self.assertTrue(
+            api_url.startswith(
+                "https://www.ozon.kz/api/composer-api.bx/page/json/v2?"
+            )
+        )
+        self.assertIn(
+            "url=%2Fproduct%2Fredmond-rmc-m52-4103859568%2F%3Ffrom%3Dshare",
+            api_url,
+        )
+        self.assertIn("layout_container=pdpPage2column", api_url)
+
+    def test_product_worker_uses_composer_api_before_browser(self):
+        worker = ProductWorker(1)
+        response = SimpleNamespace(
+            status_code=200,
+            text=r'''
+            {
+              "widgetStates": {
+                "webStickyProducts-123": "{\"name\":\"REDMOND RMC-M52 мультиварка\",\"coverImageUrl\":\"https://img.test/item.jpg\"}",
+                "webPrice-123": "{\"cardPrice\":\"34 990 ₸\",\"originalPrice\":\"39 990 ₸\"}"
+              }
+            }
+            ''',
+        )
+
+        with (
+            patch(
+                "src.parsers.product_parser.requests.get",
+                return_value=response,
+            ) as get,
+            patch.object(worker, "_ensure_driver") as ensure_driver,
+        ):
+            product = worker._parse_single_product(
+                "4103859568",
+                "https://ozon.kz/product/redmond-rmc-m52-4103859568/",
+            )
+
+        get.assert_called_once()
+        ensure_driver.assert_not_called()
+        self.assertTrue(product.success)
+        self.assertEqual(product.name, "REDMOND RMC-M52 мультиварка")
+        self.assertEqual(product.price, 34990)
+        self.assertEqual(product.original_price, 39990)
+        self.assertEqual(product.image_url, "https://img.test/item.jpg")
+
     def test_product_worker_replaces_generic_ozon_title_from_metadata(self):
         worker = ProductWorker(1)
         product = ProductInfo(
