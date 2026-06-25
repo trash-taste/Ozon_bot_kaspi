@@ -4,6 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     CHROME_BIN=/usr/bin/chromium \
+    PLAYWRIGHT_CHROMIUM_PATH=/usr/bin/chromium \
     TZ=Asia/Qyzylorda
 
 RUN apt-get update \

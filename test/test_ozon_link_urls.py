@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.parsers.link_parser import OzonLinkParser
+from src.parsers.ozon_playwright_parser import OzonPlaywrightParser
 from src.parsers.product_parser import (
     ProductInfo,
     ProductWorker,
@@ -98,6 +99,34 @@ class OzonProductURLTests(unittest.TestCase):
 
         self.assertEqual(
             self.parser._extract_product_links_from_html(),
+            ["https://ozon.kz/product/redmond-rmc-m52-4103859568/"],
+        )
+
+    def test_playwright_parser_normalizes_relative_product_url(self):
+        parser = OzonPlaywrightParser(
+            "https://ozon.kz/category/test-123/",
+            max_products=1,
+        )
+
+        self.assertEqual(
+            parser._normalize_product_url(
+                "/product/redmond-rmc-m52-4103859568/",
+                "https://ozon.kz/category/test-123/",
+            ),
+            "https://ozon.kz/product/redmond-rmc-m52-4103859568/",
+        )
+
+    def test_playwright_parser_extracts_urlencoded_product_links(self):
+        parser = OzonPlaywrightParser(
+            "https://ozon.kz/category/test-123/",
+            max_products=1,
+        )
+
+        self.assertEqual(
+            parser._extract_product_links_from_html(
+                "https%3A%2F%2Fozon.kz%2Fproduct%2F"
+                "redmond-rmc-m52-4103859568%2F"
+            ),
             ["https://ozon.kz/product/redmond-rmc-m52-4103859568/"],
         )
 

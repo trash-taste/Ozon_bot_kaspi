@@ -10,6 +10,8 @@ services:
     environment:
       TZ: Asia/Qyzylorda
       CHROME_BIN: /usr/bin/chromium
+      PLAYWRIGHT_CHROMIUM_PATH: /usr/bin/chromium
+      OZON_USE_PLAYWRIGHT: "1"
       PYTHONUNBUFFERED: "1"
       OZON_PAGE_LOAD_TIMEOUT: "30"
       OZON_ANTIBOT_TIMEOUT: "45"
